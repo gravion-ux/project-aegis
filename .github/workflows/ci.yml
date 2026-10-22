@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "phase-*"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["18", "20", "22"]
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Print the runtime version
+        run: node --version
+
+      - name: Install dependencies (no external dependencies expected)
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --ignore-scripts
+          elif [ -f package.json ]; then
+            npm install --ignore-scripts --no-audit --no-fund
+          else
+            echo "no package.json - nothing to install"
+          fi
+
+      - name: Run the full test suite
+        run: npm test
+
+      - name: Run the Phase 1 compatibility suite
+        run: npm run test:phase1
+
+      - name: Offline provider smoke check (no credentials)
+        run: node aegis/cli.js providers smoke
+        env:
+          AEGIS_LLM_URL: ""
+          AEGIS_LLM_AUTH_HEADER: ""
+
+      - name: CLI doctor
+        run: node aegis/cli.js doctor
+
+      - name: Assert no credential is present in the tracked tree
+        run: node scripts/scan-secrets.js
