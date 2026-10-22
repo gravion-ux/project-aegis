@@ -1,0 +1,38 @@
+{
+  "name": "project-aegis",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Project AEGIS — multi-agent AI system core. Phase 0–1: task lifecycle, deterministic agents, persistent storage, audit trail, CLI. Phase 2: persistent memory, provider abstraction, default-deny tool registry, budgets, specialist agents, orchestrator, cancellation and checkpoint/resume.",
+  "main": "aegis/index.js",
+  "bin": {
+    "aegis": "aegis/cli.js"
+  },
+  "scripts": {
+    "test": "node --test test/states.test.js test/task.test.js test/storage.test.js test/audit.test.js test/redact.test.js test/agent.test.js test/memory.test.js test/cli.test.js test/memory2.test.js test/providers.test.js test/tools.test.js test/usage.test.js test/orchestrator.test.js test/recovery.test.js test/phase1-compat.test.js test/regressions.test.js",
+    "test:phase1": "node --test test/states.test.js test/task.test.js test/storage.test.js test/audit.test.js test/redact.test.js test/agent.test.js test/memory.test.js test/cli.test.js",
+    "test:phase2": "node --test test/memory2.test.js test/providers.test.js test/tools.test.js test/usage.test.js test/orchestrator.test.js test/recovery.test.js test/phase1-compat.test.js test/regressions.test.js",
+    "demo": "node aegis/cli.js doctor",
+    "smoke": "node aegis/cli.js providers smoke",
+    "scan:secrets": "node scripts/scan-secrets.js"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "task",
+    "audit",
+    "cli",
+    "aegis"
+  ],
+  "author": "Priyanshu Kumar Thakur",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "aegis/",
+    "docs/",
+    "examples/",
+    "README.md",
+    "LICENSE"
+  ]
+}
