@@ -1,0 +1,32 @@
+{
+  "_comment": "Example Project AEGIS configuration. Copy to aegis.config.json and edit. NEVER put an API key, token, or password in this file — set AEGIS_LLM_AUTH_HEADER in your environment instead.",
+
+  "provider": {
+    "_comment": "default 'offline' is deterministic and needs no credentials. To use a real local model server set AEGIS_LLM_URL and change default to a model name.",
+    "default": "offline",
+    "allowPaid": false,
+    "timeoutMs": 30000,
+    "maxRetries": 1
+  },
+
+  "budget": {
+    "_comment": "All limits are optional. null means 'no limit'. pricing must be filled in by the operator from their provider's published rate card — do not guess.",
+    "maxInputChars": null,
+    "maxOutputChars": 200000,
+    "maxTokens": null,
+    "maxCost": null,
+    "pricing": null
+  },
+
+  "runtime": {
+    "maxIterations": 3,
+    "maxWallMs": 60000,
+    "maxDelegationDepth": 2,
+    "maxRetries": 2
+  },
+
+  "memory": {
+    "retentionMs": null,
+    "maxRecordsPerProject": 5000
+  }
+}
