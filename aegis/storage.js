@@ -14,6 +14,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { isSafeIdentifier, recordPath } = require('./paths');
 
 class Storage {
   constructor(rootDir) {
@@ -53,9 +54,14 @@ class Storage {
   }
 
   get(taskId) {
-    const meta = this._index.tasks[taskId];
+    // An id that could escape the state directory is simply "not found";
+    // it is never used to build a path.
+    if (!isSafeIdentifier(taskId)) return null;
+    const meta = Object.prototype.hasOwnProperty.call(this._index.tasks, taskId)
+      ? this._index.tasks[taskId]
+      : null;
     if (!meta) return null;
-    const file = path.join(this.root, `${taskId}.json`);
+    const file = recordPath(this.root, taskId, '.json', 'task id');
     if (!fs.existsSync(file)) return null;
     try {
       const full = JSON.parse(fs.readFileSync(file, 'utf-8'));
@@ -67,7 +73,9 @@ class Storage {
 
   put(task) {
     if (!task || !task.id) throw new Error('storage.put: task.id is required');
-    const file = path.join(this.root, `${task.id}.json`);
+    // A write must never land outside the state directory, so an unsafe id
+    // is a hard error rather than a silent no-op.
+    const file = recordPath(this.root, task.id, '.json', 'task id');
     this._writeAtomic(file, JSON.stringify(task, null, 2));
     this._index.tasks[task.id] = {
       id: task.id,
@@ -81,7 +89,8 @@ class Storage {
   }
 
   remove(taskId) {
-    const file = path.join(this.root, `${taskId}.json`);
+    if (!isSafeIdentifier(taskId)) return;
+    const file = recordPath(this.root, taskId, '.json', 'task id');
     if (fs.existsSync(file)) fs.unlinkSync(file);
     delete this._index.tasks[taskId];
     this._saveIndex();

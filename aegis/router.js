@@ -70,8 +70,12 @@ const COMMANDS = {
     handler: async (ctx, args) => {
       const id = args[0];
       if (!id) return { code: 2, output: { error: 'task id required' } };
-      const t = Task.fromJSON(ctx.storage.get(id));
-      if (!t) return { code: 2, output: { error: `no such task: ${id}` } };
+      // Look the task up before deserialising it. Task.fromJSON throws on
+      // a missing id, so calling it on a null result turns "no such task"
+      // into a fatal error.
+      const raw = ctx.storage.get(id);
+      if (!raw) return { code: 2, output: { error: `no such task: ${id}` } };
+      const t = Task.fromJSON(raw);
       if (isTerminal(t.state)) {
         return { code: 2, output: { error: `task is in terminal state: ${t.state}` } };
       }
@@ -104,8 +108,9 @@ const COMMANDS = {
     handler: (ctx, args) => {
       const id = args[0];
       if (!id) return { code: 2, output: { error: 'task id required' } };
-      const t = Task.fromJSON(ctx.storage.get(id));
-      if (!t) return { code: 2, output: { error: `no such task: ${id}` } };
+      const raw = ctx.storage.get(id);
+      if (!raw) return { code: 2, output: { error: `no such task: ${id}` } };
+      const t = Task.fromJSON(raw);
       if (isTerminal(t.state)) {
         return { code: 2, output: { error: `task already terminal: ${t.state}` } };
       }

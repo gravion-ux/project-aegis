@@ -33,6 +33,7 @@ const { ToolRegistry, buildDefaultRegistry: buildDefaultTools } = require('./too
 const { Budget, BudgetManager } = require('./usage');
 const { Manifest, Orchestrator, buildDefaultManifest, synthesiseDeclaration } = require('./orchestrator');
 const specialists = require('./specialists');
+const paths = require('./paths');
 const { Checkpoint, CheckpointStore, Idempotency } = require('./recovery');
 const { loadConfig, validateConfig, DEFAULTS } = require('./config');
 
@@ -53,7 +54,16 @@ function createContext(opts = {}) {
   const toolRegistry = opts.toolRegistry || buildDefaultTools();
   const providerRegistry = opts.providerRegistry || new ProviderRegistry();
   const config = opts.config || loadConfig(root, opts.env || process.env);
-  const budgets = opts.budgets || new BudgetManager();
+  // The configured budget limits are applied to the manager, so the limits
+  // reported by `aegis usage` are the limits that are actually enforced.
+  // Previously they were displayed but never applied to anything.
+  const budgets = opts.budgets || new BudgetManager({
+    maxInputChars: config.budget.maxInputChars,
+    maxOutputChars: config.budget.maxOutputChars,
+    maxTokens: config.budget.maxTokens,
+    maxCost: config.budget.maxCost,
+    pricing: config.budget.pricing,
+  });
   const manifest = opts.manifest || buildDefaultManifest(agentRegistry);
   const checkpoints = opts.checkpoints || new CheckpointStore(stateDir);
   const providerRouter = new ProviderRouter({
@@ -63,7 +73,7 @@ function createContext(opts = {}) {
   });
   const orchestrator = new Orchestrator({
     manifest, agentRegistry, toolRegistry, memory,
-    budget: opts.budget || null, audit, providerRouter,
+    budget: opts.budget || budgets, audit, providerRouter,
   });
 
   return {
@@ -107,6 +117,7 @@ module.exports = {
   buildDefaultManifest,
   synthesiseDeclaration,
   specialists,
+  paths,
   Checkpoint,
   CheckpointStore,
   Idempotency,

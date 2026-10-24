@@ -20,9 +20,9 @@
  */
 
 const fs = require('node:fs');
-const path = require('node:path');
 const crypto = require('node:crypto');
 const { redact } = require('./redact');
+const { recordPath } = require('./paths');
 
 const MEMORY_TYPES = new Set(['fact', 'decision', 'assumption', 'unresolved', 'evidence', 'preference']);
 const VALID_TYPES = MEMORY_TYPES;
@@ -103,11 +103,11 @@ class Memory {
   }
 
   _file(projectId) {
-    return path.join(this.root, `${projectId || 'default'}.json`);
+    return recordPath(this.root, projectId || 'default', '.json', 'project id');
   }
 
   _checkpointFile(projectId) {
-    return path.join(this.root, `${projectId || 'default'}.checkpoint.json`);
+    return recordPath(this.root, projectId || 'default', '.checkpoint.json', 'project id');
   }
 
   // ---- persistence with quarantine ----

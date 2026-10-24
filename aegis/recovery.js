@@ -14,6 +14,7 @@
  */
 
 const { STATES } = require('./states');
+const { isSafeIdentifier, recordPath } = require('./paths');
 
 class CancellationError extends Error {
   constructor(message = 'cancelled') {
@@ -54,6 +55,10 @@ class Checkpoint {
 
 /**
  * Persist and load checkpoints under `state/<taskId>.checkpoint.json`.
+ *
+ * The task id is caller-supplied, so it is validated before it is turned
+ * into a filename — see `aegis/paths.js`. A traversing id must not be able
+ * to make the store read or write outside the state directory.
  */
 class CheckpointStore {
   constructor(stateDir, fsModule) {
@@ -61,22 +66,34 @@ class CheckpointStore {
     this.fs = fsModule || require('node:fs');
     this.path = require('node:path');
   }
-  _file(taskId) { return this.path.join(this.dir, `${taskId}.checkpoint.json`); }
+  _file(taskId) { return recordPath(this.dir, taskId, '.checkpoint.json', 'task id'); }
   load(taskId) {
-    const f = this._file(taskId);
+    if (!isSafeIdentifier(taskId)) return null;
+    let f;
+    try { f = this._file(taskId); } catch { return null; }
     if (!this.fs.existsSync(f)) return null;
-    try { return Checkpoint.fromJSON(JSON.parse(this.fs.readFileSync(f, 'utf-8'))); }
-    catch { return null; }
+    try {
+      const cp = Checkpoint.fromJSON(JSON.parse(this.fs.readFileSync(f, 'utf-8')));
+      // The id inside the file must match the id that was asked for.
+      // Otherwise a checkpoint copied under another task's name would be
+      // loaded as if it belonged to this task, and a later save() would
+      // write it back under the other task's name.
+      if (cp.taskId !== taskId) return null;
+      return cp;
+    } catch { return null; }
   }
   save(cp) {
     if (!cp) return;
+    const file = this._file(cp.taskId); // throws INVALID_ID / PATH_ESCAPE
     this.fs.mkdirSync(this.dir, { recursive: true });
-    const tmp = `${this._file(cp.taskId)}.tmp`;
+    const tmp = `${file}.tmp`;
     this.fs.writeFileSync(tmp, JSON.stringify(cp.toJSON(), null, 2));
-    this.fs.renameSync(tmp, this._file(cp.taskId));
+    this.fs.renameSync(tmp, file);
   }
   clear(taskId) {
-    const f = this._file(taskId);
+    if (!isSafeIdentifier(taskId)) return;
+    let f;
+    try { f = this._file(taskId); } catch { return; }
     if (this.fs.existsSync(f)) this.fs.unlinkSync(f);
   }
 }

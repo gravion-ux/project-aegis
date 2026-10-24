@@ -22,6 +22,12 @@ const http = require('node:http');
 const https = require('node:https');
 const { URL } = require('node:url');
 const { assertRequest, ProviderError } = require('./base');
+const { redactString } = require('../redact');
+
+// A model server that streams an unbounded body would otherwise be able
+// to exhaust this process's memory. 8 MiB is far above any realistic
+// chat completion.
+const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 
 class HttpProvider {
   constructor(opts = {}) {
@@ -33,6 +39,7 @@ class HttpProvider {
     this.model = opts.model || 'unknown';
     this.authHeader = opts.authHeader || null;
     this.timeoutMs = opts.timeoutMs || 30_000;
+    this.maxResponseBytes = opts.maxResponseBytes || MAX_RESPONSE_BYTES;
     this._totalInput = 0;
     this._totalOutput = 0;
     this._totalTokens = 0;
@@ -50,7 +57,7 @@ class HttpProvider {
     if (this.authHeader) headers.authorization = this.authHeader;
     const body = JSON.stringify({ model: this.model, messages: request.messages, ...(request.options || {}) });
 
-    const text = await postJson(url, body, headers, this.timeoutMs);
+    const text = await postJson(url, body, headers, this.timeoutMs, this.maxResponseBytes);
     const parsed = safeJson(text);
     const out = extractTextAndUsage(parsed, text);
 
@@ -81,11 +88,13 @@ class HttpProvider {
   }
 }
 
-function postJson(urlText, body, headers, timeoutMs) {
+function postJson(urlText, body, headers, timeoutMs, maxResponseBytes = MAX_RESPONSE_BYTES) {
   return new Promise((resolve, reject) => {
     let u;
     try { u = new URL(urlText); } catch (e) { return reject(new ProviderError(`bad url: ${e.message}`)); }
     const transport = u.protocol === 'https:' ? https : http;
+    let settled = false;
+    const done = (fn, v) => { if (settled) return; settled = true; fn(v); };
     const req = transport.request({
       method: 'POST',
       hostname: u.hostname,
@@ -95,16 +104,35 @@ function postJson(urlText, body, headers, timeoutMs) {
       timeout: timeoutMs,
     }, (res) => {
       const chunks = [];
-      res.on('data', (c) => chunks.push(c));
+      let total = 0;
+      res.on('data', (c) => {
+        total += c.length;
+        if (total > maxResponseBytes) {
+          req.destroy();
+          done(reject, new ProviderError(
+            `response exceeded ${maxResponseBytes} bytes`,
+            { retryable: false },
+          ));
+          return;
+        }
+        chunks.push(c);
+      });
       res.on('end', () => {
         const text = Buffer.concat(chunks).toString('utf-8');
-        if (res.statusCode >= 500) return reject(new ProviderError(`server ${res.statusCode}: ${text.slice(0, 500)}`, { retryable: true }));
-        if (res.statusCode >= 400) return reject(new ProviderError(`client ${res.statusCode}: ${text.slice(0, 500)}`));
-        resolve(text);
+        // The error body is redacted before it becomes an error message:
+        // a server that echoes the request headers must not be able to
+        // leak the auth header into a log line.
+        if (res.statusCode >= 500) {
+          return done(reject, new ProviderError(`server ${res.statusCode}: ${redactString(text.slice(0, 500))}`, { retryable: true }));
+        }
+        if (res.statusCode >= 400) {
+          return done(reject, new ProviderError(`client ${res.statusCode}: ${redactString(text.slice(0, 500))}`));
+        }
+        done(resolve, text);
       });
     });
     req.on('timeout', () => req.destroy(new ProviderError('timeout', { retryable: true })));
-    req.on('error', (err) => reject(new ProviderError(`http error: ${err.message}`, { retryable: true })));
+    req.on('error', (err) => done(reject, new ProviderError(`http error: ${redactString(err.message)}`, { retryable: true })));
     req.end(body);
   });
 }

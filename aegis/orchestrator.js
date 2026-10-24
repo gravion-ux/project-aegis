@@ -230,6 +230,30 @@ class Orchestrator {
     let lastError = null;
     let iterations = 0;
 
+    // The budget is a gate, not just an accounting note. Before each
+    // attempt the current state is checked, so a task cannot start work
+    // when the budget is already exhausted, and a retry loop cannot run
+    // past a limit that the budget is meant to enforce.
+    //
+    // The budget may be a plain Budget or a BudgetManager. A manager
+    // enforces the global budget and the task's own budget together, so
+    // it is addressed by task id.
+    const isManager = !!(this.budget && typeof this.budget.forTask === 'function');
+    const budgetGuard = () => {
+      if (!this.budget) return;
+      if (typeof this.budget.guard === 'function') {
+        if (isManager) this.budget.guard(task.id); else this.budget.guard();
+        return;
+      }
+      if (this.budget.global && typeof this.budget.global.guard === 'function') this.budget.global.guard();
+    };
+    const budgetRecord = (usage) => {
+      if (!this.budget) return;
+      if (isManager) { this.budget.record(task.id, usage); return; }
+      if (typeof this.budget.record === 'function') { this.budget.record(usage); return; }
+      if (this.budget.global && typeof this.budget.global.record === 'function') this.budget.global.record(usage);
+    };
+
     while (iterations < maxIterations) {
       if (signal.aborted) {
         audit('orchestrator.aborted', { taskId: task.id, iterations });
@@ -238,6 +262,12 @@ class Orchestrator {
       if (Date.now() - start > maxWallMs) {
         audit('orchestrator.timeout', { taskId: task.id, iterations });
         throw new OrchestratorError(`maxWallMs ${maxWallMs} exceeded`, { code: 'TIMEOUT' });
+      }
+      try {
+        budgetGuard();
+      } catch (err) {
+        audit('orchestrator.budget_exceeded', { taskId: task.id, iterations });
+        throw err;
       }
       iterations += 1;
 
@@ -251,15 +281,27 @@ class Orchestrator {
           signal,
         });
         validateOutput(declared.outputSchema, result);
-        if (this.budget) {
-          try { this.budget.record({ input: 0, output: JSON.stringify(result.output || '').length, tokens: null }); }
-          catch (err) { audit('orchestrator.budget_exceeded', { taskId: task.id }); throw err; }
+        // Every attempt is charged, including the successful one. The
+        // attempt count is what bounds retries.
+        try {
+          budgetRecord({ input: 0, output: JSON.stringify(result.output || '').length, tokens: null, attempt: true });
+        } catch (err) {
+          audit('orchestrator.budget_exceeded', { taskId: task.id });
+          throw err;
         }
         audit('orchestrator.end', { taskId: task.id, iterations, status: result.status });
         return result;
       } catch (err) {
         lastError = err;
         if (err instanceof ProviderError && err.retryable && iterations < maxIterations) {
+          // Charge the failed attempt before retrying, so the budget sees
+          // the real cost of the retry loop rather than only the final
+          // successful call.
+          try { budgetRecord({ input: 0, output: 0, tokens: null, attempt: true }); }
+          catch (budgetErr) {
+            audit('orchestrator.budget_exceeded', { taskId: task.id, iterations });
+            throw budgetErr;
+          }
           audit('orchestrator.retry', { taskId: task.id, iterations, error: err.message });
           continue;
         }
