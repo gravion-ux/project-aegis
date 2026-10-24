@@ -10,7 +10,8 @@ exercise the suspected behaviour directly. A finding was only recorded when
 the code and a probe agreed.
 
 **Result:** 14 findings, all reproduced before the fix and all pinned by a
-regression test afterwards. 218 tests, 217 pass, 0 fail, 1 skipped (see
+regression test afterwards. 220 tests, 219 pass, 0 fail, 1 skipped on the
+Windows audit host; **220 pass, 0 skipped** on the Linux CI runner (see
 [Not tested](#not-tested)).
 
 > A green suite is not a security property. Several of the findings below
@@ -296,8 +297,17 @@ of each allowed root, so a link that leaves the root is refused.
 
 **Not reproducible on the audit host** — creating a symlink on Windows
 requires a privilege this account does not have (`EPERM`). The regression
-test skips locally and **runs on the Linux CI runner**. See
-[Not tested](#not-tested).
+test therefore **skips locally** and **runs on the Linux CI runner**.
+
+**Verified on Linux CI** — run `40103601935` on commit `34d63a6` executed
+the test and passed it on all three matrix legs:
+
+```
+ok 162 - security: fs.read refuses to follow a symlink out of the allowed root
+```
+
+L1 is therefore fixed-by-test, not only fixed-by-inspection. The Windows
+skip is an environment limitation, not an untested path.
 
 ### L2 — The HTTP provider buffered an unbounded response
 
@@ -371,8 +381,8 @@ the same interfaces, the same default-deny posture.
 
 ### Regression suite
 
-`test/security-hardening.test.js` — **45 tests, 44 pass, 0 fail, 1
-skipped.**
+`test/security-hardening.test.js` — **47 tests, 46 pass, 0 fail, 1
+skipped** on Windows; **47 pass, 0 skipped** on Linux CI.
 
 Each test names the finding it pins. The mapping:
 
@@ -404,11 +414,14 @@ the hardening did not break legitimate use.
 
 ```
 npm test
-  tests 218
-  pass  217
+  tests 220
+  pass  219
   fail  0
   skipped 1     (the symlink test — see below)
 ```
+
+On the Linux CI runner the same suite reports **220 tests, 220 pass, 0
+fail, 0 skipped** — the symlink test executes there instead of skipping.
 
 ### Phase 1 compatibility
 
@@ -441,8 +454,23 @@ The smoke and doctor steps run with `AEGIS_LLM_URL` and
 or echo a secret.
 
 The GitHub Actions workflow (`.github/workflows/ci.yml`) runs the same
-steps on a Node 18 / 20 / 22 matrix. The previous run was green on all
-three; the run for this work is triggered by pushing these commits.
+steps on a Node 18 / 20 / 22 matrix.
+
+**Run `40103601935`** on commit `34d63a6` — <https://github.com/gravion-ux/project-aegis/actions/runs/40103601935>
+— completed with conclusion **`success`**. All three legs
+(`test (node 18)`, `test (node 20)`, `test (node 22)` on `ubuntu-latest`)
+passed every step, and the job logs confirm the counts read back from the
+runners themselves:
+
+| job | full suite | Phase 1 suite | symlink test |
+| --- | ---------- | -------------- | ------------ |
+| node 18 | 220 / 220 pass, 0 skipped | 56 / 56 pass | `ok 162` |
+| node 20 | 220 / 220 pass, 0 skipped | 56 / 56 pass | `ok 162` |
+| node 22 | 220 / 220 pass, 0 skipped | 56 / 56 pass | `ok 162` |
+
+The smoke step ran with `AEGIS_LLM_URL` and `AEGIS_LLM_AUTH_HEADER`
+explicitly empty, so CI reached no model and echoed no secret; the
+credential-scan step reported `no credential-shaped strings found`.
 
 ### Lint / type checks
 
@@ -496,12 +524,12 @@ Stated plainly, because a passing suite is not a security property.
    paid credential is available. The HTTP provider was tested against a
    local mock server only. Its behaviour against Ollama, LM Studio,
    llama.cpp or a hosted API is **unverified**.
-2. **The symlink escape (L1) was not reproduced on the audit host.**
+2. **The symlink escape (L1) could not be reproduced on the audit host.**
    Creating a symlink on Windows needs a privilege this account lacks
-   (`EPERM`). The fix is implemented and the regression test is written,
-   but the test **skips locally**. It runs on the Linux CI runner — until
-   that run is observed, treat L1 as fixed-by-inspection rather than
-   fixed-by-test.
+   (`EPERM`), so the test **skips on Windows**. It was **executed and
+   passed on the Linux CI runner** (run `40103601935`, all three matrix
+   legs, `ok 162`). The symlink escape is therefore fixed-by-test; the
+   Windows skip is an environment limitation, not an untested path.
 3. **No concurrency or race testing was performed.** The cancellation and
    timeout fixes are single-threaded tests. A tool that aborts at exactly
    its timeout boundary was not exercised.
@@ -525,8 +553,9 @@ Stated plainly, because a passing suite is not a security property.
 
 ## Next steps
 
-1. Run the CI matrix on this branch and confirm the symlink test passes
-   on the Linux runner — that closes the last open item in this audit.
+1. ~~Run the CI matrix on this branch and confirm the symlink test passes
+   on the Linux runner.~~ **Done** — run `40103601935` is green on Node
+   18 / 20 / 22 and the symlink test passed on all three legs.
 2. Give `Budget` a real `maxAttempts` in `aegis.config.example.json` so
    the retry bound is on by default rather than available.
 3. Decide the audit-log treatment for tool inputs (residual risk 6).
