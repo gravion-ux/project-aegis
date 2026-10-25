@@ -22,6 +22,8 @@ const { audit } = (() => {
   return { audit: null };
 })();
 
+const { redactString } = require('../redact');
+
 class ToolError extends Error {
   constructor(message, { code = 'TOOL_ERROR', retryable = false, cause = null } = {}) {
     super(message);
@@ -54,6 +56,15 @@ const RISK = Object.freeze({
 });
 
 const RISK_RANK = { read: 1, mutate: 2, external: 3, destructive: 4 };
+
+/**
+ * The ceiling applied when a task does not name one.
+ *
+ * It is the highest level any shipped tool carries, so the default does
+ * not change what the built-in tools can do — but a `destructive` tool has
+ * to be opted into explicitly instead of inheriting a permissive ceiling.
+ */
+const DEFAULT_MAX_RISK = 'external';
 
 // Hard ceiling on what a single tool call may pull into memory. The
 // registry-level `maxOutputBytes` truncates *after* a tool returns, which
@@ -102,6 +113,11 @@ class Tool {
 class ToolRegistry {
   constructor() {
     this._byName = new Map();
+    /**
+     * Number of audit events that could not be appended. A non-zero value
+     * means the audit trail for this registry is incomplete.
+     */
+    this.auditFailures = 0;
   }
 
   register(tool) {
@@ -132,12 +148,29 @@ class ToolRegistry {
       this._audit(ctx, 'tool.deny', { name, reason: 'not_registered' });
       throw new ToolNotFoundError(name);
     }
-    const allowed = (ctx.allowedTools || []).includes(name);
+    // The allowlist must be an array. If a caller passes a string, the
+    // previous `String.prototype.includes` did *substring* matching, so
+    // `allowedTools: 'xechox'` would have allowed the `echo` tool. A value
+    // that is not a list of names is treated as an empty allowlist.
+    const allowedTools = Array.isArray(ctx.allowedTools) ? ctx.allowedTools : [];
+    const allowed = allowedTools.includes(name);
     if (!allowed) {
       this._audit(ctx, 'tool.deny', { name, reason: 'not_in_allowed_tools' });
       throw new ToolDeniedError(name, 'not in task allowedTools');
     }
-    const maxRisk = ctx.maxRiskLevel || 'destructive';
+    // The risk ceiling must be a known level. An unrecognised value used to
+    // fall through to `RISK_RANK[x] || 4`, which silently granted the
+    // most permissive ceiling instead of refusing.
+    //
+    // When no ceiling is given, the default is the highest level any
+    // shipped tool carries (`external`). A `destructive` tool therefore has
+    // to be opted into explicitly by the caller, rather than running under
+    // an implicit permissive ceiling.
+    const maxRisk = ctx.maxRiskLevel == null ? DEFAULT_MAX_RISK : ctx.maxRiskLevel;
+    if (!Object.prototype.hasOwnProperty.call(RISK_RANK, maxRisk)) {
+      this._audit(ctx, 'tool.deny', { name, reason: 'invalid_max_risk' });
+      throw new ToolDeniedError(name, `unknown task max risk level ${JSON.stringify(maxRisk)}`);
+    }
     if ((RISK_RANK[tool.riskLevel] || 0) > (RISK_RANK[maxRisk] || 4)) {
       this._audit(ctx, 'tool.deny', { name, reason: 'exceeds_max_risk' });
       throw new ToolDeniedError(name, `tool risk ${tool.riskLevel} > task max ${maxRisk}`);
@@ -146,6 +179,15 @@ class ToolRegistry {
     if (ctx.signal && ctx.signal.aborted) {
       this._audit(ctx, 'tool.deny', { name, reason: 'aborted' });
       throw new ToolError(`tool "${name}" not started: the run was cancelled`, { code: 'ABORTED' });
+    }
+    // The declared input schema is enforced here, in the execution layer,
+    // so a tool can never be reached with an input its own declaration
+    // forbids.
+    try {
+      validateInput(tool.inputSchema, input);
+    } catch (err) {
+      this._audit(ctx, 'tool.deny', { name, reason: 'invalid_input' });
+      throw err;
     }
 
     this._audit(ctx, 'tool.call.start', { name, inputSummary: summariseInput(input) });
@@ -201,7 +243,14 @@ class ToolRegistry {
 
   _audit(ctx, kind, payload) {
     if (ctx.audit && typeof ctx.audit.append === 'function') {
-      try { ctx.audit.append({ kind, ...payload }); } catch { /* never let audit failures break a tool call */ }
+      try {
+        ctx.audit.append({ kind, ...payload });
+      } catch {
+        // An audit failure must not break a tool call, but it must not be
+        // invisible either: the count is exposed so a caller can detect that
+        // the audit trail is incomplete.
+        this.auditFailures += 1;
+      }
     }
   }
 }
@@ -209,9 +258,75 @@ class ToolRegistry {
 function summariseInput(input) {
   try {
     const s = JSON.stringify(input || {});
-    if (s.length <= 200) return s;
-    return s.slice(0, 200) + '…';
+    // The summary is written to the audit log, so credential-shaped text is
+    // removed before it is recorded.
+    const safe = redactString(s);
+    if (safe.length <= 200) return safe;
+    return safe.slice(0, 200) + '…';
   } catch { return '<unserialisable>'; }
+}
+
+/**
+ * Minimal JSON Schema validation for tool input declarations.
+ *
+ * Only the subset the tool declarations actually use is supported:
+ * `type` (object / array / string / number / integer / boolean / null),
+ * `required` (property names), and `properties` (per-property `type`).
+ * An absent or empty schema accepts anything, so a tool that declares no
+ * schema keeps its previous behaviour.
+ *
+ * @throws {ToolError} with code `TOOL_INPUT_INVALID`
+ */
+function validateInput(schema, input) {
+  if (!schema || typeof schema !== 'object') return;
+  if (schema.type && !matchesType(schema.type, input)) {
+    throw new ToolError(
+      `invalid input: expected ${schema.type}, got ${describeType(input)}`,
+      { code: 'TOOL_INPUT_INVALID' },
+    );
+  }
+  if (Array.isArray(schema.required)) {
+    for (const key of schema.required) {
+      if (input == null || typeof input !== 'object' || !(key in input)) {
+        throw new ToolError(`invalid input: missing required property "${key}"`, {
+          code: 'TOOL_INPUT_INVALID',
+        });
+      }
+    }
+  }
+  if (schema.properties && typeof schema.properties === 'object' && input && typeof input === 'object') {
+    for (const [key, prop] of Object.entries(schema.properties)) {
+      if (!prop || typeof prop !== 'object') continue;
+      if (!(key in input)) continue;
+      const value = input[key];
+      if (value === undefined) continue;
+      if (prop.type && !matchesType(prop.type, value)) {
+        throw new ToolError(
+          `invalid input: property "${key}" expected ${prop.type}, got ${describeType(value)}`,
+          { code: 'TOOL_INPUT_INVALID' },
+        );
+      }
+    }
+  }
+}
+
+function matchesType(type, value) {
+  switch (type) {
+    case 'object': return value !== null && typeof value === 'object' && !Array.isArray(value);
+    case 'array': return Array.isArray(value);
+    case 'string': return typeof value === 'string';
+    case 'number': return typeof value === 'number' && Number.isFinite(value);
+    case 'integer': return typeof value === 'number' && Number.isInteger(value);
+    case 'boolean': return typeof value === 'boolean';
+    case 'null': return value === null;
+    default: return true;
+  }
+}
+
+function describeType(value) {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  return typeof value;
 }
 
 // ---- built-in safe tools ----
@@ -256,25 +371,12 @@ const safeRead = new Tool({
       throw new ToolError(`fs.read: ${abs} is outside allowed roots`, { code: 'TOOL_DENIED' });
     }
 
-    let stat;
-    try { stat = fs.statSync(abs); }
-    catch { throw new ToolError(`fs.read: cannot stat ${abs}`, { code: 'TOOL_ERROR' }); }
-    if (!stat.isFile()) {
-      throw new ToolError('fs.read: not a regular file', { code: 'TOOL_DENIED' });
-    }
-    // Refuse an oversized file *before* reading it. The registry-level
-    // output cap truncates after the fact, which still means the whole
-    // file was pulled into memory first.
-    if (stat.size > MAX_READ_BYTES) {
-      throw new ToolError(
-        `fs.read: file is ${stat.size} bytes, over the ${MAX_READ_BYTES} byte limit`,
-        { code: 'TOOL_OUTPUT_TOO_LARGE' },
-      );
-    }
-
-    // Re-check containment against the *resolved* path, so a symlink
+    // Resolve containment against the *resolved* path first, so a symlink
     // inside an allowed root cannot point outside it.
     const realAbs = safeRealpath(fs, abs);
+    if (!realAbs) {
+      throw new ToolError(`fs.read: cannot resolve ${abs}`, { code: 'TOOL_ERROR' });
+    }
     const stillInside = ctx.allowedRoots.some((r) => {
       const realRoot = safeRealpath(fs, path.resolve(r));
       if (!realRoot) return false;
@@ -284,10 +386,35 @@ const safeRead = new Tool({
       throw new ToolError(`fs.read: ${abs} resolves outside allowed roots`, { code: 'TOOL_DENIED' });
     }
 
-    if (ctx.signal && ctx.signal.aborted) {
-      throw new ToolError('fs.read: cancelled', { code: 'ABORTED' });
+    // The file is opened by its already-validated real path and the bytes are
+    // read from that descriptor. Checking a path and then reading the path
+    // again leaves a window in which the final component can be swapped for a
+    // symlink; pinning the descriptor means the size check and the bytes that
+    // are actually read describe the same file.
+    let fd;
+    try { fd = fs.openSync(realAbs, 'r'); }
+    catch { throw new ToolError(`fs.read: cannot open ${abs}`, { code: 'TOOL_ERROR' }); }
+    try {
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile()) {
+        throw new ToolError('fs.read: not a regular file', { code: 'TOOL_DENIED' });
+      }
+      // Refuse an oversized file *before* reading it. The registry-level
+      // output cap truncates after the fact, which still means the whole
+      // file was pulled into memory first.
+      if (stat.size > MAX_READ_BYTES) {
+        throw new ToolError(
+          `fs.read: file is ${stat.size} bytes, over the ${MAX_READ_BYTES} byte limit`,
+          { code: 'TOOL_OUTPUT_TOO_LARGE' },
+        );
+      }
+      if (ctx.signal && ctx.signal.aborted) {
+        throw new ToolError('fs.read: cancelled', { code: 'ABORTED' });
+      }
+      return fs.readFileSync(fd, 'utf-8');
+    } finally {
+      try { fs.closeSync(fd); } catch { /* ignore */ }
     }
-    return fs.readFileSync(realAbs, 'utf-8');
   },
 });
 
