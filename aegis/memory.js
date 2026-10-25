@@ -123,7 +123,18 @@ class Memory {
   }
 
   _writeFile(f, records) {
-    fs.writeFileSync(f, JSON.stringify(records, null, 2));
+    // The whole file is rewritten on every write, so a non-atomic write
+    // risks losing every record in the store if the process dies
+    // mid-write. The record set is staged next to the target and renamed
+    // into place, which is atomic on every supported platform.
+    const tmp = `${f}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 10)}.tmp`;
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(records, null, 2));
+      fs.renameSync(tmp, f);
+    } catch (err) {
+      try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+      throw err;
+    }
   }
 
   _all(projectId) {
@@ -296,16 +307,23 @@ class Memory {
       else byType.other.push(r);
     }
 
+    // A context assembled for one task must not carry another task's
+    // task-scoped records. Project-wide records (taskId null) belong to
+    // every task; records bound to a different task do not.
+    const scoped = taskId
+      ? (r) => r.taskId == null || r.taskId === taskId
+      : (r) => r.taskId == null;
+
     return {
       projectId,
       taskId: taskId || null,
       query: query || null,
       checkpoint: checkpoint || null,
       matches: all.slice(0, maxItems).map((m) => m.id || m),
-      verified: byType.verified.slice(0, maxItems),
-      assumption: byType.assumption.slice(0, maxItems),
-      unresolved: byType.unresolved.slice(0, maxItems),
-      other: byType.other.slice(0, maxItems),
+      verified: byType.verified.filter(scoped).slice(0, maxItems),
+      assumption: byType.assumption.filter(scoped).slice(0, maxItems),
+      unresolved: byType.unresolved.filter(scoped).slice(0, maxItems),
+      other: byType.other.filter(scoped).slice(0, maxItems),
       taskScoped: taskRecords.slice(0, maxItems),
     };
   }
