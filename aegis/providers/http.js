@@ -34,6 +34,16 @@ class HttpProvider {
     if (!opts.baseUrl) {
       throw new Error('HttpProvider: baseUrl is required');
     }
+    // Only http(s) is a transport this provider can actually speak. Any
+    // other scheme (`file:`, `data:`, `ftp:` …) is refused at construction
+    // time rather than being handed to a transport that would mis-handle
+    // it. The URL is parsed here so a malformed baseUrl also fails fast.
+    let parsed;
+    try { parsed = new URL(opts.baseUrl); }
+    catch (e) { throw new Error(`HttpProvider: baseUrl is not a valid URL: ${e.message}`); }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new Error(`HttpProvider: unsupported protocol ${JSON.stringify(parsed.protocol)}; only http: and https: are allowed`);
+    }
     this.name = opts.name || 'http';
     this.baseUrl = opts.baseUrl;
     this.model = opts.model || 'unknown';
@@ -57,16 +67,19 @@ class HttpProvider {
     if (this.authHeader) headers.authorization = this.authHeader;
     const body = JSON.stringify({ model: this.model, messages: request.messages, ...(request.options || {}) });
 
-    const text = await postJson(url, body, headers, this.timeoutMs, this.maxResponseBytes);
+    const text = await postJson(url, body, headers, this.timeoutMs, this.maxResponseBytes, request.signal);
     const parsed = safeJson(text);
     const out = extractTextAndUsage(parsed, text);
 
     this._totalInput += request.messages.reduce((n, m) => n + m.content.length, 0);
     this._totalOutput += out.text.length;
-    if (out.usage && out.usage.total != null) {
+    if (out.usage && out.usage.reported) {
       this._totalTokens += out.usage.total;
       this._tokenSource = 'reported';
     } else {
+      // The server did not report a usable counter. The totals are an
+      // estimate, and they are labelled as one rather than being recorded
+      // as a measured zero.
       this._tokenSource = 'estimated';
     }
     return { text: out.text, model: this.model, finishReason: 'stop', usage: out.usage, raw: parsed };
@@ -88,13 +101,48 @@ class HttpProvider {
   }
 }
 
-function postJson(urlText, body, headers, timeoutMs, maxResponseBytes = MAX_RESPONSE_BYTES) {
+function postJson(urlText, body, headers, timeoutMs, maxResponseBytes = MAX_RESPONSE_BYTES, signal = null) {
   return new Promise((resolve, reject) => {
     let u;
     try { u = new URL(urlText); } catch (e) { return reject(new ProviderError(`bad url: ${e.message}`)); }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+      return reject(new ProviderError(`unsupported protocol ${JSON.stringify(u.protocol)}`, { retryable: false }));
+    }
     const transport = u.protocol === 'https:' ? https : http;
     let settled = false;
-    const done = (fn, v) => { if (settled) return; settled = true; fn(v); };
+    const done = (fn, v) => { if (settled) return; settled = true; cleanup(); fn(v); };
+
+    // A hard deadline for the whole exchange. `req.setTimeout` only covers
+    // socket inactivity, so a server that trickles one byte at a time can
+    // keep the request open indefinitely. The deadline closes it regardless.
+    const deadline = setTimeout(() => {
+      const err = new ProviderError(`request timeout after ${timeoutMs}ms`, { retryable: true, code: 'TIMEOUT' });
+      try { req.destroy(err); } catch { /* ignore */ }
+      done(reject, err);
+    }, timeoutMs);
+    if (typeof deadline.unref === 'function') deadline.unref();
+
+    const onAbort = () => {
+      const err = new ProviderError('request aborted', { retryable: false, code: 'ABORTED' });
+      try { req.destroy(err); } catch { /* ignore */ }
+      done(reject, err);
+    };
+
+    function cleanup() {
+      clearTimeout(deadline);
+      if (signal && typeof signal.removeEventListener === 'function') {
+        signal.removeEventListener('abort', onAbort);
+      }
+    }
+
+    if (signal) {
+      if (signal.aborted) {
+        clearTimeout(deadline);
+        return reject(new ProviderError('request aborted', { retryable: false, code: 'ABORTED' }));
+      }
+      if (typeof signal.addEventListener === 'function') signal.addEventListener('abort', onAbort, { once: true });
+    }
+
     const req = transport.request({
       method: 'POST',
       hostname: u.hostname,
@@ -128,10 +176,24 @@ function postJson(urlText, body, headers, timeoutMs, maxResponseBytes = MAX_RESP
         if (res.statusCode >= 400) {
           return done(reject, new ProviderError(`client ${res.statusCode}: ${redactString(text.slice(0, 500))}`));
         }
+        // A 3xx is not a model response. Resolving with the redirect body
+        // would hand a redirect page to the caller as if it were model
+        // output, and the auth header would already have been sent to the
+        // first hop. Redirects are not followed; they are reported.
+        if (res.statusCode >= 300) {
+          return done(reject, new ProviderError(
+            `unexpected redirect status ${res.statusCode}; redirects are not followed`,
+            { retryable: false },
+          ));
+        }
         done(resolve, text);
       });
     });
-    req.on('timeout', () => req.destroy(new ProviderError('timeout', { retryable: true })));
+    req.on('timeout', () => {
+      const err = new ProviderError(`request timeout after ${timeoutMs}ms`, { retryable: true, code: 'TIMEOUT' });
+      try { req.destroy(err); } catch { /* ignore */ }
+      done(reject, err);
+    });
     req.on('error', (err) => done(reject, new ProviderError(`http error: ${redactString(err.message)}`, { retryable: true })));
     req.end(body);
   });
@@ -155,14 +217,37 @@ function extractTextAndUsage(parsed, rawText) {
       else if (typeof c.text === 'string') text = c.text;
     }
     if (parsed.usage && typeof parsed.usage === 'object') {
-      const i = Number(parsed.usage.prompt_tokens || parsed.usage.input_tokens || 0);
-      const o = Number(parsed.usage.completion_tokens || parsed.usage.output_tokens || 0);
-      const t = Number(parsed.usage.total_tokens || (i + o) || 0);
-      usage = { input: i, output: o, total: t };
+      const i = readCount(parsed.usage.prompt_tokens ?? parsed.usage.input_tokens);
+      const o = readCount(parsed.usage.completion_tokens ?? parsed.usage.output_tokens);
+      const t = readCount(parsed.usage.total_tokens);
+      // Only a value the server actually reported is marked `reported`. A
+      // missing or unusable counter is an estimate, never a silent zero —
+      // `reported: false` is what tells the budget layer that this number
+      // was not measured.
+      const reported = i != null || o != null || t != null;
+      const input = i != null ? i : 0;
+      const output = o != null ? o : 0;
+      const total = t != null ? t : input + output;
+      usage = { input, output, total, reported };
     }
   }
   if (!text) text = typeof rawText === 'string' ? rawText : '';
   return { text, usage };
+}
+
+/**
+ * Read a counter that a model server reported.
+ *
+ * A non-numeric or negative counter is not a measurement, so it is treated
+ * as absent rather than being coerced into `NaN` or a negative total.
+ *
+ * @returns {number|null}
+ */
+function readCount(value) {
+  if (value === undefined || value === null) return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return n;
 }
 
 module.exports = { HttpProvider, extractTextAndUsage };
