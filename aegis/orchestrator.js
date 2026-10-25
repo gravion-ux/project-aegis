@@ -314,6 +314,15 @@ class Orchestrator {
   }
 }
 
+/**
+ * Validate an agent result against its declared output schema.
+ *
+ * The check is recursive: a nested object (for example the `output` of the
+ * `review` role) has its own `properties`, and each one is checked for
+ * presence, type and enum membership. A schema that only lists the names of
+ * the top-level fields would accept a result whose nested values are of the
+ * wrong type, which is exactly what the manifest declares against.
+ */
 function validateOutput(schema, result) {
   if (!schema || !result) return;
   if (schema.required) {
@@ -328,6 +337,67 @@ function validateOutput(schema, result) {
       throw new OrchestratorError(`output.status "${result.status}" not in enum`, { code: 'SCHEMA_VIOLATION' });
     }
   }
+  validateAgainstSchema(schema, result, 'output');
+}
+
+/**
+ * Recursive schema check for one value.
+ *
+ * @param {object} schema the schema fragment describing `value`
+ * @param {*} value the value to check
+ * @param {string} path the location of `value`, used in the error message
+ */
+function validateAgainstSchema(schema, value, path) {
+  if (!schema || typeof schema !== 'object') return;
+
+  if (Array.isArray(schema.enum)) {
+    if (!schema.enum.includes(value)) {
+      throw new OrchestratorError(
+        `${path} "${JSON.stringify(value)}" not in enum ${JSON.stringify(schema.enum)}`,
+        { code: 'SCHEMA_VIOLATION' },
+      );
+    }
+  }
+
+  if (schema.type && !matchesSchemaType(schema.type, value)) {
+    throw new OrchestratorError(
+      `${path} expected ${schema.type}, got ${describeValueType(value)}`,
+      { code: 'SCHEMA_VIOLATION' },
+    );
+  }
+
+  if (schema.properties && value && typeof value === 'object' && !Array.isArray(value)) {
+    if (Array.isArray(schema.required)) {
+      for (const key of schema.required) {
+        if (!(key in value)) {
+          throw new OrchestratorError(`${path} missing required field "${key}"`, { code: 'SCHEMA_VIOLATION' });
+        }
+      }
+    }
+    for (const [key, sub] of Object.entries(schema.properties)) {
+      if (!(key in value)) continue;
+      validateAgainstSchema(sub, value[key], `${path}.${key}`);
+    }
+  }
+}
+
+function matchesSchemaType(type, value) {
+  switch (type) {
+    case 'object': return value !== null && typeof value === 'object' && !Array.isArray(value);
+    case 'array': return Array.isArray(value);
+    case 'string': return typeof value === 'string';
+    case 'number': return typeof value === 'number' && Number.isFinite(value);
+    case 'integer': return typeof value === 'number' && Number.isInteger(value);
+    case 'boolean': return typeof value === 'boolean';
+    case 'null': return value === null;
+    default: return true;
+  }
+}
+
+function describeValueType(value) {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  return typeof value;
 }
 
 module.exports = { Orchestrator, Manifest, OrchestratorError, buildDefaultManifest, synthesiseDeclaration, BUILTIN_AGENTS };
