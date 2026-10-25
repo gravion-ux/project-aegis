@@ -19,14 +19,24 @@
  *      string rules miss (Windows drive-relative paths, UNC paths, and any
  *      platform-specific normalisation).
  *
- * The identifier rules are deliberately permissive about characters that are
- * legal in a filename. The goal is to reject *traversal*, not to impose a
- * naming convention on callers.
+ * The identifier rules reject *traversal*, not a naming convention. The one
+ * extra restriction they do impose is portability: characters that cannot
+ * form a filename on every supported platform are refused, so the same
+ * identifier behaves identically on Linux, macOS and Windows instead of
+ * succeeding on one platform and failing with a raw OS error on another.
  */
 
 const path = require('node:path');
 
 const MAX_IDENTIFIER_LENGTH = 255;
+
+// Characters that are legal in a POSIX filename but not in a Windows one.
+const WINDOWS_RESERVED_CHARS = /[<>:"/\\|?*]/;
+// ASCII control characters are rejected on every platform.
+const CONTROL_CHARS = /[\x00-\x1F\x7F]/;
+// Device names that Windows reserves. `CON.json` is as reserved as `CON`,
+// because the name is what matters, not the extension.
+const WINDOWS_DEVICE_NAMES = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 
 function invalidIdentifier(id, label) {
   const err = new Error(`${label} is not a valid identifier: ${JSON.stringify(String(id))}`);
@@ -39,7 +49,9 @@ function invalidIdentifier(id, label) {
  *
  * Rejects: non-strings, empty strings, over-long strings, NUL bytes, the
  * relative-directory tokens `.` and `..`, anything containing `/` or `\`,
- * absolute paths, and Windows drive-relative paths such as `C:foo`.
+ * absolute paths, Windows drive-relative paths such as `C:foo`, control
+ * characters, the characters Windows reserves in a filename, and the
+ * Windows device names.
  */
 function isSafeIdentifier(id) {
   if (typeof id !== 'string') return false;
@@ -49,6 +61,9 @@ function isSafeIdentifier(id) {
   if (id.includes('/') || id.includes('\\')) return false;
   if (path.isAbsolute(id)) return false;
   if (/^[A-Za-z]:/.test(id)) return false;
+  if (CONTROL_CHARS.test(id)) return false;
+  if (WINDOWS_RESERVED_CHARS.test(id)) return false;
+  if (WINDOWS_DEVICE_NAMES.test(id)) return false;
   return true;
 }
 
