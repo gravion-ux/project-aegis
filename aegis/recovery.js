@@ -22,11 +22,20 @@ class CancellationError extends Error {
   }
 }
 
+/**
+ * Checkpoint versions this build understands. A checkpoint written by a
+ * newer or unknown format is rejected rather than silently reinterpreted.
+ */
+const SUPPORTED_CHECKPOINT_VERSIONS = new Set([1]);
+
 class Checkpoint {
   constructor({ taskId, completed = [], pending = [], lastSeq = 0, version = 1 } = {}) {
     this.taskId = taskId;
-    this.completed = completed;          // [{ seq, name, output, idempotencyKey, ts }]
-    this.pending = pending;              // [{ seq, name, input, idempotencyKey }]
+    // The collections are normalised on construction. A checkpoint read from
+    // disk with a non-array value would otherwise fail much later, far from
+    // the point where the corruption entered.
+    this.completed = Array.isArray(completed) ? completed : [];
+    this.pending = Array.isArray(pending) ? pending : [];
     this.lastSeq = lastSeq;
     this.version = version;
     this.ts = new Date().toISOString();
@@ -49,6 +58,29 @@ class Checkpoint {
   }
   static fromJSON(j) {
     if (!j || !j.taskId) throw new Error('Checkpoint.fromJSON: missing taskId');
+    // The shape is checked before the checkpoint is accepted. A record whose
+    // collections are not arrays would otherwise load successfully and then
+    // fail deep inside the resume path with an unrelated TypeError.
+    if (j.completed !== undefined && !Array.isArray(j.completed)) {
+      throw new Error('Checkpoint.fromJSON: completed must be an array');
+    }
+    if (j.pending !== undefined && !Array.isArray(j.pending)) {
+      throw new Error('Checkpoint.fromJSON: pending must be an array');
+    }
+    // Every entry must be an object. A `null` or a primitive inside the
+    // collections would fail later, when the resume path reads a field off
+    // it, far from the corrupt file that introduced it.
+    for (const [field, list] of [['completed', j.completed], ['pending', j.pending]]) {
+      if (!Array.isArray(list)) continue;
+      for (const entry of list) {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+          throw new Error(`Checkpoint.fromJSON: ${field} entries must be objects`);
+        }
+      }
+    }
+    if (j.version !== undefined && !SUPPORTED_CHECKPOINT_VERSIONS.has(j.version)) {
+      throw new Error(`Checkpoint.fromJSON: unsupported checkpoint version ${JSON.stringify(j.version)}`);
+    }
     return new Checkpoint(j);
   }
 }
@@ -86,9 +118,16 @@ class CheckpointStore {
     if (!cp) return;
     const file = this._file(cp.taskId); // throws INVALID_ID / PATH_ESCAPE
     this.fs.mkdirSync(this.dir, { recursive: true });
-    const tmp = `${file}.tmp`;
-    this.fs.writeFileSync(tmp, JSON.stringify(cp.toJSON(), null, 2));
-    this.fs.renameSync(tmp, file);
+    // A unique temporary name, so two writers cannot share (and corrupt) the
+    // same staging file. The rename is atomic on every supported platform.
+    const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 10)}.tmp`;
+    try {
+      this.fs.writeFileSync(tmp, JSON.stringify(cp.toJSON(), null, 2));
+      this.fs.renameSync(tmp, file);
+    } catch (err) {
+      try { this.fs.unlinkSync(tmp); } catch { /* ignore */ }
+      throw err;
+    }
   }
   clear(taskId) {
     if (!isSafeIdentifier(taskId)) return;
@@ -125,9 +164,9 @@ function buildPlanFromTask(task, totalSteps) {
 
 function detectInterrupted(cp) {
   if (!cp) return false;
-  // Heuristic: a checkpoint whose `ts` is older than the task's
-  // `updatedAt` indicates that the process died after the last
-  // recorded step and before recording the next.
+  // A checkpoint that holds both completed and pending steps is the resume
+  // case: the run finished some steps and still has work left. A checkpoint
+  // with nothing pending has nothing to resume.
   return cp.pending.length > 0 && cp.completed.length > 0;
 }
 
