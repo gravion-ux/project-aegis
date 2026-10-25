@@ -35,7 +35,7 @@ skip.
 | Low | 3 | fixed, regression-tested |
 | **Total** | **29** | **fixed** |
 
-**Files changed:** 14 modified, 4 added, 0 removed. **Dependencies added: 0.**
+**Files changed:** 13 modified, 4 added, 0 removed. **Dependencies added: 0.**
 
 ---
 
@@ -554,7 +554,6 @@ cannot choose the platform.
 | `aegis/audit.js` | key from `opts.key` → `AEGIS_AUDIT_KEY` → per-process random; `keyIsPersistent`; new `verify()` |
 | `scripts/scan-secrets.js` | the fixture allowlist is now **scoped to `test/`**; Phase 2.2 fixtures added |
 | `package.json` | `test:adversarial` and `test:phase22` scripts; the two new suites added to `test` and `test:phase2` |
-| `.github/workflows/ci.yml` | explicit steps for the two new suites |
 | `test/adversarial.test.js` | **new** — 35 deterministic adversarial, fuzz and concurrency tests |
 | `test/phase22-regressions.test.js` | **new** — 32 named regression tests, one per finding |
 
@@ -649,6 +648,21 @@ parses it.
 ---
 
 ## CI results
+
+### The workflow was not modified
+
+`.github/workflows/ci.yml` is **unchanged**. The connected GitHub App
+deliberately refuses writes to `.github/` — the directory that controls what
+runs inside the repository — so a workflow edit could not be published. That
+turned out to cost nothing: the existing workflow's "Run the full test suite"
+step invokes `npm test`, and `npm test` now includes both new suites. The
+matrix therefore executes all 287 tests, including the 35 adversarial and 32
+regression tests, exactly as it would have with two extra named steps.
+
+Two additional scripts are available for anyone who wants to run the suites
+in isolation: `npm run test:adversarial` and `npm run test:phase22`.
+
+### Verified runs
 
 <!-- CI-RESULTS -->
 
