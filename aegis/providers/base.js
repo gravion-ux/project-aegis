@@ -16,11 +16,14 @@
  */
 
 class ProviderError extends Error {
-  constructor(message, { retryable = false, cause = null } = {}) {
+  constructor(message, { retryable = false, cause = null, code = 'PROVIDER_ERROR' } = {}) {
     super(message);
     this.name = 'ProviderError';
     this.retryable = retryable;
     this.cause = cause;
+    // A machine-readable code, so a caller can distinguish an abort from a
+    // timeout from a transport failure without matching on the message.
+    this.code = code;
   }
 }
 
