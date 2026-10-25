@@ -114,12 +114,16 @@ class Budget {
 
   /**
    * Preflight check: would recording this much usage exceed the budget?
+   *
+   * The check mirrors `record()` exactly, including the attempt ceiling, so
+   * a refusal never charges the budget it refused.
    */
-  wouldExceed({ input = 0, output = 0, tokens = null } = {}) {
+  wouldExceed({ input = 0, output = 0, tokens = null, attempt = false } = {}) {
     const L = this.limits;
     if (L.inputChars   != null && this.inputChars + input   > L.inputChars)   return 'inputChars';
     if (L.outputChars  != null && this.outputChars + output > L.outputChars)  return 'outputChars';
     if (L.tokens       != null && this.tokens     + (tokens || 0) > L.tokens)  return 'tokens';
+    if (L.attempts     != null && this.attempts + (attempt ? 1 : 0) > L.attempts) return 'attempts';
     if (L.estimatedCost != null && this.pricing) {
       const est = (input / 1000) * Number(this.pricing.inputPer1k || 0)
                 + (output / 1000) * Number(this.pricing.outputPer1k || 0);
@@ -231,23 +235,32 @@ class BudgetManager {
 
   record(taskId, usage) {
     // Preflight against BOTH the global and the per-task budget before
-    // anything is recorded. `wouldExceed` takes {input, output, tokens},
-    // so the trial object must use those exact keys.
-    const trial = { input: usage.input || 0, output: usage.output || 0, tokens: usage.tokens || 0 };
-    if (this.global.wouldExceed(trial)) {
-      const err = new Error('global budget exceeded');
+    // anything is recorded. The trial object must use the same keys and the
+    // same attempt semantics as `record()`, otherwise a refusal would still
+    // charge the budget it refused.
+    const trial = {
+      input: usage.input || 0,
+      output: usage.output || 0,
+      tokens: usage.tokens || 0,
+      attempt: usage.attempt === true,
+    };
+    const globalOver = this.global.wouldExceed(trial);
+    if (globalOver) {
+      const err = new Error(`global budget exceeded (${globalOver})`);
       err.code = 'BUDGET_EXCEEDED';
       err.summary = this.global.summary();
       throw err;
     }
     const taskBudget = this.forTask(taskId);
-    if (taskBudget.wouldExceed(trial)) {
-      const err = new Error('task budget exceeded');
+    const taskOver = taskBudget.wouldExceed(trial);
+    if (taskOver) {
+      const err = new Error(`task budget exceeded (${taskOver})`);
       err.code = 'BUDGET_EXCEEDED';
       err.summary = taskBudget.summary();
       throw err;
     }
-    // Neither record() can throw now — both check before mutating.
+    // Neither record() can throw now — both check before mutating, and the
+    // preflight covered the same conditions.
     this.global.record(usage);
     taskBudget.record(usage);
   }
