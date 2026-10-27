@@ -27,6 +27,7 @@
  */
 
 const path = require('node:path');
+const fs = require('node:fs');
 
 const MAX_IDENTIFIER_LENGTH = 255;
 
@@ -106,10 +107,39 @@ function recordPath(root, id, suffix, label = 'identifier') {
   return resolveWithin(root, `${id}${suffix}`, `${label} file`);
 }
 
+/**
+ * Find a file in `root` that a case-insensitive filesystem would consider
+ * the same file as `filename`, other than `filename` itself.
+ *
+ * `Alpha.json` and `alpha.json` are two files on Linux and one file on
+ * Windows and macOS. A store that lets both identifiers exist therefore
+ * behaves differently on each platform, and a directory moved from Linux to
+ * Windows silently collapses the two records into one. Every store refuses
+ * such an identifier *pair* up front instead, so the check must not depend
+ * on the host filesystem: it compares names itself.
+ *
+ * @returns {string|null} the colliding filename, or null when there is none
+ */
+function findFilenameVariant(root, filename) {
+  let entries;
+  try {
+    entries = fs.readdirSync(root);
+  } catch {
+    return null;
+  }
+  const want = String(filename).toLowerCase();
+  for (const name of entries) {
+    if (name === filename) continue;
+    if (name.toLowerCase() === want) return name;
+  }
+  return null;
+}
+
 module.exports = {
   isSafeIdentifier,
   assertSafeIdentifier,
   resolveWithin,
   recordPath,
+  findFilenameVariant,
   MAX_IDENTIFIER_LENGTH,
 };
