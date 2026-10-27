@@ -22,7 +22,7 @@
 const fs = require('node:fs');
 const crypto = require('node:crypto');
 const { redact } = require('./redact');
-const { recordPath } = require('./paths');
+const { recordPath, findFilenameVariant } = require('./paths');
 
 const MEMORY_TYPES = new Set(['fact', 'decision', 'assumption', 'unresolved', 'evidence', 'preference']);
 const VALID_TYPES = MEMORY_TYPES;
@@ -110,6 +110,28 @@ class Memory {
     return recordPath(this.root, projectId || 'default', '.checkpoint.json', 'project id');
   }
 
+  /**
+   * Read the raw file at `f`, distinguishing "absent" from "present but not
+   * what this namespace writes".
+   *
+   * The three states matter separately:
+   *   - absent        → nothing to protect
+   *   - unparseable   → this namespace's own damaged file; it may be replaced
+   *   - parsed, but
+   *     not an array  → a foreign document; it may not be overwritten
+   *
+   * @returns {{missing: boolean, parsed?: boolean, body?: object, array?: boolean}}
+   */
+  _readRaw(f) {
+    if (!fs.existsSync(f)) return { missing: true };
+    try {
+      const parsed = JSON.parse(fs.readFileSync(f, 'utf-8'));
+      return { missing: false, parsed: true, body: parsed, array: Array.isArray(parsed) };
+    } catch {
+      return { missing: false, parsed: false };
+    }
+  }
+
   // ---- persistence with quarantine ----
 
   _readFile(f) {
@@ -167,6 +189,34 @@ class Memory {
     if (!input || input.key == null || input.key === '') {
       throw new Error('memory.add: key is required');
     }
+    // A project file is only ever written through the project id it belongs
+    // to. Two names reach one file: a case-insensitive filesystem
+    // (`ProjectX` / `projectx`), and a project id ending in `.checkpoint`,
+    // whose record file is another project's checkpoint file. Writing either
+    // would mix or destroy another project's records, so ownership is
+    // verified before the first write. A file that cannot be parsed is
+    // still rewritten: it is this project's own damaged file, and replacing
+    // it is the documented recovery.
+    const pid = projectId || 'default';
+    const file = this._file(projectId);
+    const raw = this._readRaw(file);
+    const variant = findFilenameVariant(this.root, `${pid}.json`);
+    if (raw.parsed && !raw.array) {
+      const err = new Error(
+        `memory.add: project id ${JSON.stringify(pid)} resolves to a file that already holds ` +
+        `a non-record document; refusing to overwrite it`,
+      );
+      err.code = 'PROJECT_ID_CONFLICT';
+      throw err;
+    }
+    if (variant) {
+      const err = new Error(
+        `memory.add: project id ${JSON.stringify(pid)} differs only by case from existing project ` +
+        `${JSON.stringify(variant.slice(0, -'.json'.length))}; refusing to mix their records`,
+      );
+      err.code = 'PROJECT_ID_CONFLICT';
+      throw err;
+    }
     const normalised = normalize(input, projectId, opts.taskId);
     const error = validate(normalised);
     if (error) throw new Error(`memory.add: ${error}`);
@@ -174,7 +224,6 @@ class Memory {
     // redact before write
     const safe = redact(normalised);
 
-    const file = this._file(projectId);
     const { good } = this._all(projectId);
     if (opts.allowDuplicate !== true) {
       const existing = good.find((r) => r.key === safe.key);
@@ -265,6 +314,41 @@ class Memory {
   saveCheckpoint(projectId, snapshot) {
     if (!projectId) throw new Error('projectId required');
     if (!snapshot || typeof snapshot !== 'object') throw new Error('snapshot must be an object');
+    const pid = projectId;
+    // A checkpoint file is only ever written through the project id it
+    // belongs to. The two aliasing cases are a case-variant project id
+    // (one file on Windows/macOS, two on Linux) and a *project* named
+    // `x.checkpoint`, whose record file is this checkpoint's file. Both are
+    // refused before the write, so records are never destroyed by an id
+    // that merely spells another id differently. A file that cannot be
+    // parsed is still replaced: it is this project's own damaged checkpoint.
+    const cpFile = this._checkpointFile(projectId);
+    const raw = this._readRaw(cpFile);
+    const variant = findFilenameVariant(this.root, `${pid}.checkpoint.json`);
+    if (!raw.missing && raw.body != null && raw.body.projectId !== pid) {
+      const err = new Error(
+        `memory.saveCheckpoint: project id ${JSON.stringify(pid)} resolves to a checkpoint that ` +
+        `belongs to project ${JSON.stringify(raw.body.projectId)}; refusing to overwrite it`,
+      );
+      err.code = 'PROJECT_ID_CONFLICT';
+      throw err;
+    }
+    if (!raw.missing && raw.array) {
+      const err = new Error(
+        `memory.saveCheckpoint: project id ${JSON.stringify(pid)} resolves to a project record file; ` +
+        `refusing to overwrite it`,
+      );
+      err.code = 'PROJECT_ID_CONFLICT';
+      throw err;
+    }
+    if (variant) {
+      const err = new Error(
+        `memory.saveCheckpoint: project id ${JSON.stringify(pid)} differs only by case from ` +
+        `project ${JSON.stringify(variant.slice(0, -'.checkpoint.json'.length))}; refusing to overwrite its checkpoint`,
+      );
+      err.code = 'PROJECT_ID_CONFLICT';
+      throw err;
+    }
     const safe = redact({
       projectId,
       ts: new Date().toISOString(),
@@ -280,9 +364,17 @@ class Memory {
   }
 
   loadCheckpoint(projectId) {
+    const pid = projectId || 'default';
     const f = this._checkpointFile(projectId);
     if (!fs.existsSync(f)) return null;
-    try { return JSON.parse(fs.readFileSync(f, 'utf-8')); }
+    try {
+      const parsed = JSON.parse(fs.readFileSync(f, 'utf-8'));
+      // The checkpoint served must be the one this project id asked for. On
+      // a case-insensitive filesystem a case-variant id reaches another
+      // project's checkpoint file; the embedded project id is the tiebreaker.
+      if (!parsed || typeof parsed !== 'object' || parsed.projectId !== pid) return null;
+      return parsed;
+    }
     catch { return null; }
   }
 
