@@ -17,7 +17,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { isSafeIdentifier, recordPath } = require('./paths');
+const { isSafeIdentifier, recordPath, findFilenameVariant } = require('./paths');
 
 /**
  * An empty task map with a null prototype.
@@ -50,6 +50,43 @@ class Storage {
     fs.mkdirSync(this.root, { recursive: true });
     this.indexPath = path.join(this.root, '_index.json');
     this._index = this._loadIndex();
+  }
+
+  /**
+   * Find an existing task whose id differs from `taskId` only by case.
+   *
+   * `Alpha` and `alpha` are the *same file* on a case-insensitive filesystem
+   * (Windows, macOS) but two different files on Linux. Relying on the
+   * filesystem to detect the collision therefore makes the behaviour
+   * platform-dependent: on Linux the second write silently created a second
+   * file, and a directory moved between platforms then collapsed both tasks
+   * into one.
+   *
+   * AEGIS therefore compares identifiers itself, so the same id always means
+   * the same task on every platform. Both the index (the record of known
+   * task ids) and the directory listing (which also catches a file that is
+   * present on disk but missing from the index) are consulted.
+   *
+   * @returns {string|null} the conflicting id, or null when there is none
+   */
+  _findCaseCollision(taskId) {
+    const wanted = taskId.toLowerCase();
+
+    // Known task ids, straight from the shared index on disk.
+    const index = this._loadIndex();
+    for (const key of Object.keys(index.tasks)) {
+      if (key !== taskId && key.toLowerCase() === wanted) return key;
+    }
+
+    // Files in this directory whose name differs from this task's file only
+    // by case. This also covers the checkpoint namespace: a task id of
+    // `X.CHECKPOINT` resolves to `X.CHECKPOINT.json`, which is task `x`'s
+    // checkpoint file under another spelling.
+    const variant = findFilenameVariant(this.root, `${taskId}.json`);
+    if (variant) {
+      return variant.endsWith('.json') ? variant.slice(0, -'.json'.length) : variant;
+    }
+    return null;
   }
 
   /**
@@ -154,23 +191,45 @@ class Storage {
     const file = recordPath(this.root, task.id, '.json', 'task id');
     // The index has its own filename inside the same directory. A task id
     // that resolves to it would overwrite the index on the next save, so
-    // the collision is refused.
-    if (path.resolve(file) === path.resolve(this.indexPath)) {
+    // the collision is refused. The comparison is case-insensitive because
+    // `_INDEX` and `_index` are the same file on Windows and macOS; refusing
+    // both everywhere keeps the behaviour identical across platforms.
+    if (path.basename(file).toLowerCase() === path.basename(this.indexPath).toLowerCase()) {
       const err = new Error(
         `storage.put: task id ${JSON.stringify(task.id)} resolves to the task index file`,
       );
       err.code = 'INVALID_ID';
       throw err;
     }
-    // Two different ids can resolve to the same file on a case-insensitive
-    // filesystem (`Alpha` and `alpha`). Writing would silently destroy the
-    // other task's record, so the conflict is refused instead — the same
-    // behaviour on every platform.
+    // The file at this path must be *this* task's record before it may be
+    // overwritten. Two names reach one file: a case-insensitive filesystem
+    // (`Alpha` / `alpha`), and an id ending in `.checkpoint` (a task named
+    // `x.checkpoint` resolves to task `x`'s checkpoint file). In both cases
+    // the existing file embeds a different id — or no id at all, when it is
+    // a checkpoint — and writing would destroy a record this store does not
+    // own. A file that cannot be read at all is refused too: ownership
+    // cannot be established, and remove() + put() is the documented way to
+    // rewrite a damaged record.
     const existing = this._readTaskFile(file);
-    if (existing && existing.id != null && existing.id !== task.id) {
+    if (fs.existsSync(file) && (!existing || existing.id !== task.id)) {
+      const owner = existing && existing.id ? ` (it holds task ${JSON.stringify(existing.id)})` : '';
       const err = new Error(
-        `storage.put: task id ${JSON.stringify(task.id)} resolves to the same file as existing task ` +
-        `${JSON.stringify(existing.id)}; refusing to overwrite it`,
+        `storage.put: task id ${JSON.stringify(task.id)} resolves to a file that already holds ` +
+        `another record${owner}; refusing to overwrite it. Remove the task first if the record ` +
+        `is damaged and must be replaced.`,
+      );
+      err.code = 'TASK_ID_CONFLICT';
+      throw err;
+    }
+    // The file check above only fires when the filesystem itself aliases the
+    // two names. On a case-sensitive filesystem (Linux) `Alpha` and `alpha`
+    // are two separate files and the check above sees nothing, so the
+    // collision is detected from the identifiers themselves.
+    const caseCollision = this._findCaseCollision(task.id);
+    if (caseCollision) {
+      const err = new Error(
+        `storage.put: task id ${JSON.stringify(task.id)} differs only by case from existing task ` +
+        `${JSON.stringify(caseCollision)}; refusing to overwrite it`,
       );
       err.code = 'TASK_ID_CONFLICT';
       throw err;
@@ -189,6 +248,11 @@ class Storage {
   remove(taskId) {
     if (!isSafeIdentifier(taskId)) return;
     const file = recordPath(this.root, taskId, '.json', 'task id');
+    // On a case-insensitive filesystem `alpha.json` and `Alpha.json` are the
+    // same file, so unlinking without checking would destroy a different
+    // task's record. The id recorded inside the file must match exactly.
+    const existing = this._readTaskFile(file);
+    if (existing && existing.id != null && existing.id !== taskId) return;
     if (fs.existsSync(file)) fs.unlinkSync(file);
     this._writeIndexEntry(taskId, null);
   }
