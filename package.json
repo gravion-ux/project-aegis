@@ -8,12 +8,12 @@
     "aegis": "aegis/cli.js"
   },
   "scripts": {
-    "test": "node --test test/states.test.js test/task.test.js test/storage.test.js test/audit.test.js test/redact.test.js test/agent.test.js test/memory.test.js test/cli.test.js test/memory2.test.js test/providers.test.js test/tools.test.js test/usage.test.js test/orchestrator.test.js test/recovery.test.js test/phase1-compat.test.js test/regressions.test.js test/security-hardening.test.js test/adversarial.test.js test/phase22-regressions.test.js",
+    "test": "node --test test/states.test.js test/task.test.js test/storage.test.js test/audit.test.js test/redact.test.js test/agent.test.js test/memory.test.js test/cli.test.js test/memory2.test.js test/providers.test.js test/tools.test.js test/usage.test.js test/orchestrator.test.js test/recovery.test.js test/phase1-compat.test.js test/regressions.test.js test/security-hardening.test.js test/adversarial.test.js test/phase22-regressions.test.js test/phase22-aliasing-regressions.test.js",
     "test:phase1": "node --test test/states.test.js test/task.test.js test/storage.test.js test/audit.test.js test/redact.test.js test/agent.test.js test/memory.test.js test/cli.test.js",
-    "test:phase2": "node --test test/memory2.test.js test/providers.test.js test/tools.test.js test/usage.test.js test/orchestrator.test.js test/recovery.test.js test/phase1-compat.test.js test/regressions.test.js test/security-hardening.test.js test/adversarial.test.js test/phase22-regressions.test.js",
+    "test:phase2": "node --test test/memory2.test.js test/providers.test.js test/tools.test.js test/usage.test.js test/orchestrator.test.js test/recovery.test.js test/phase1-compat.test.js test/regressions.test.js test/security-hardening.test.js test/adversarial.test.js test/phase22-regressions.test.js test/phase22-aliasing-regressions.test.js",
     "test:security": "node --test test/security-hardening.test.js",
     "test:adversarial": "node --test test/adversarial.test.js",
-    "test:phase22": "node --test test/phase22-regressions.test.js",
+    "test:phase22": "node --test test/phase22-regressions.test.js test/phase22-aliasing-regressions.test.js",
     "demo": "node aegis/cli.js doctor",
     "smoke": "node aegis/cli.js providers smoke",
     "scan:secrets": "node scripts/scan-secrets.js"
