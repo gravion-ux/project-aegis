@@ -14,7 +14,7 @@
  */
 
 const { STATES } = require('./states');
-const { isSafeIdentifier, recordPath } = require('./paths');
+const { isSafeIdentifier, recordPath, findFilenameVariant } = require('./paths');
 
 class CancellationError extends Error {
   constructor(message = 'cancelled') {
@@ -99,6 +99,20 @@ class CheckpointStore {
     this.path = require('node:path');
   }
   _file(taskId) { return recordPath(this.dir, taskId, '.checkpoint.json', 'task id'); }
+  /**
+   * Read the checkpoint file for `taskId`, tolerating a missing file.
+   * @returns {object|null} the parsed body, or null when absent/unreadable
+   */
+  _readExisting(taskId) {
+    let f;
+    try { f = this._file(taskId); } catch { return { missing: true }; }
+    if (!this.fs.existsSync(f)) return { missing: true };
+    try {
+      return { body: JSON.parse(this.fs.readFileSync(f, 'utf-8')), path: f };
+    } catch {
+      return { unreadable: true, path: f };
+    }
+  }
   load(taskId) {
     if (!isSafeIdentifier(taskId)) return null;
     let f;
@@ -117,6 +131,32 @@ class CheckpointStore {
   save(cp) {
     if (!cp) return;
     const file = this._file(cp.taskId); // throws INVALID_ID / PATH_ESCAPE
+    // A checkpoint file is only ever written through the id it belongs to.
+    // Two names reach one file: a case-insensitive filesystem (`Alpha` /
+    // `alpha` checkpoints), and a *task* named `x.checkpoint`, whose record
+    // file is this checkpoint's file. Overwriting either would destroy a
+    // record this store does not own, so ownership is verified first — by
+    // the embedded taskId when the file can be read, and by a name scan
+    // when only the casing differs. A file that cannot be read at all is
+    // refused as well: ownership cannot be established, and clear() + save()
+    // is the documented way to replace a damaged checkpoint.
+    const existing = this._readExisting(cp.taskId);
+    const variant = findFilenameVariant(this.dir, this.path.basename(file));
+    const foreign =
+      (!existing.missing && existing.body == null) ||
+      (existing.body != null && existing.body.taskId !== cp.taskId) ||
+      variant != null;
+    if (foreign) {
+      const detail = existing.body != null && existing.body.taskId != null
+        ? ` (it holds task ${JSON.stringify(existing.body.taskId)}'s checkpoint)`
+        : variant ? ` (it collides with ${JSON.stringify(variant)})` : '';
+      const err = new Error(
+        `CheckpointStore.save: task id ${JSON.stringify(cp.taskId)} resolves to a file that already holds ` +
+        `another record${detail}; refusing to overwrite it`,
+      );
+      err.code = 'TASK_ID_CONFLICT';
+      throw err;
+    }
     this.fs.mkdirSync(this.dir, { recursive: true });
     // A unique temporary name, so two writers cannot share (and corrupt) the
     // same staging file. The rename is atomic on every supported platform.
@@ -131,9 +171,16 @@ class CheckpointStore {
   }
   clear(taskId) {
     if (!isSafeIdentifier(taskId)) return;
-    let f;
-    try { f = this._file(taskId); } catch { return; }
-    if (this.fs.existsSync(f)) this.fs.unlinkSync(f);
+    // The file at this path is only deleted through the exact id it belongs
+    // to. On a case-insensitive filesystem `alpha.checkpoint.json` and
+    // `Alpha.checkpoint.json` are one file, so a case-variant id would
+    // destroy another task's checkpoint. When the file cannot be read the
+    // exact path is still this namespace's own damaged file, so deleting it
+    // is the documented recovery.
+    const existing = this._readExisting(taskId);
+    if (existing.missing) return;
+    if (existing.body != null && existing.body.taskId !== taskId) return;
+    if (this.fs.existsSync(existing.path)) this.fs.unlinkSync(existing.path);
   }
 }
 
