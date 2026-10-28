@@ -14,14 +14,24 @@ audit trail — plus the CI pipeline that guards them.
 tree before a line was changed. A finding was recorded only when a probe and
 the source agreed. Every fix is pinned by a named regression test.
 
-**Result:** **29 findings** — 13 high, 13 medium, 3 low — all reproduced
-before the fix and all regression-tested afterwards. 287 tests, 286 pass,
+**Result:** **36 findings** — 20 high, 13 medium, 3 low — all reproduced
+before the fix and all regression-tested afterwards. 294 tests, 293 pass,
 0 fail, 1 skipped on the Windows audit host; the Linux CI runner executes the
 skip.
 
-> **A passing suite is not a security property.** All 29 defects were live
+> **A passing suite is not a security property.** All 36 defects were live
 > while the baseline suite was fully green. The suite did not fail — it never
 > exercised the path.
+
+> **Seven of the findings (P22-30 … P22-36) were found by the CI runner, not
+> by the audit.** The first publication of this branch was **red on Linux**:
+> two tests failed that passed on the audit host. The cause was a fix in this
+> report that was correct on Windows and wrong on Linux — it detected a
+> filename collision by asking the *filesystem*, and only a case-insensitive
+> filesystem reports one. Chasing that down exposed the same defect in six
+> further places, all of which could destroy or leak another task's or
+> project's records. The full account is in
+> [CI results](#ci-results).
 
 ---
 
@@ -30,12 +40,12 @@ skip.
 | severity | count | status |
 | -------- | ----- | ------ |
 | Critical | 0 | — |
-| High | 13 | fixed, regression-tested |
+| High | 20 | fixed, regression-tested |
 | Medium | 13 | fixed, regression-tested |
 | Low | 3 | fixed, regression-tested |
-| **Total** | **29** | **fixed** |
+| **Total** | **36** | **fixed** |
 
-**Files changed:** 13 modified, 4 added, 0 removed. **Dependencies added: 0.**
+**Files changed:** 17 modified, 5 added, 0 removed. **Dependencies added: 0.**
 
 ---
 
@@ -50,7 +60,7 @@ skip.
 | **2.2E** memory / checkpoint / recovery | **PARTIAL** | Shape validation, version validation, atomic writes and task scoping are fixed and tested. **Crash recovery is fault-injected at the file level, not by killing a process mid-write** — no real crash was induced. |
 | **2.2F** provider reliability | **PARTIAL** | Deadlines, redirects, schemes, aborts, usage accounting and error redaction are fixed and tested against a local mock server. **No real LLM endpoint was exercised.** |
 | **2.2G** resource limits / observability | **PASS** | Budgets, attempt ceilings, output caps, response caps and hard deadlines all hold. Audit failures are now counted rather than swallowed. |
-| **2.2H** dependencies / CI | **PASS** | Zero runtime dependencies confirmed; no lockfile to drift; CI extended with the two new suites and verified green on Node 18/20/22. |
+| **2.2H** dependencies / CI | **PASS** | Zero runtime dependencies confirmed; no lockfile to drift; CI runs every new suite via `npm test`. The first matrix run failed on Linux and the failure was diagnosed to a platform-dependent fix — see [CI results](#ci-results); the matrix is green after the follow-up. |
 
 Two workstreams are **PARTIAL** because of what could *not* be exercised, not
 because something failed. The reasons are stated in [Not tested](#not-tested).
@@ -221,6 +231,85 @@ instance does not serve a stale listing.
 > window needs a lock file, which is a later phase — this fix removes the
 > wide, silent, everyday window, not the narrow theoretical one.
 
+### P22-30 … P22-36 — Identifier aliasing destroyed and leaked other records
+
+**Found by:** the CI runner, not the audit. **Files:** `aegis/storage.js`,
+`aegis/recovery.js`, `aegis/memory.js`, `aegis/paths.js`
+
+The first publication of this branch was **red on Linux** — two tests failed
+that passed on the Windows audit host. The cause was the fix for P22-02 itself.
+
+P22-02 was closed by asking the *filesystem* whether two identifiers reached
+the same file:
+
+```js
+const existing = this._readTaskFile(file);
+if (existing && existing.id != null && existing.id !== task.id) { /* refuse */ }
+```
+
+On Windows and macOS that is correct: `Alpha.json` and `alpha.json` are one
+file, so reading `alpha.json` returns Alpha's record and the collision is
+seen. On Linux they are two separate files, the read returns `null`, the guard
+does not fire, and the second task is written as a new file — **no error, no
+log, and the behaviour differs from every other platform**. The fix was
+correct only on the filesystem it was written on.
+
+The same question — *does this identifier reach a file that belongs to
+someone else?* — was being answered by the operating system in six further
+places. Chasing the CI failure down turned up all of them. Every one was
+reproduced against the **published** code before it was changed:
+
+| id | what happened | consequence |
+| -- | ------------- | ----------- |
+| **P22-30** | A task id of `_INDEX` resolved to `_index.json` (case-insensitive match) and **overwrote the task index**. The index then listed only `_INDEX`; every previously stored task became invisible to `list()` and `get()`. | whole-index loss |
+| **P22-31** | `remove('alpha')` unlinked `Alpha.json` — another task's record — because the two names are one file. | record destroyed |
+| **P22-32** | `CheckpointStore.clear('alpha')` unlinked `Alpha.checkpoint.json`, destroying another task's checkpoint and breaking its resume. | checkpoint destroyed |
+| **P22-33** | `CheckpointStore.save()` under a case-variant id **overwrote** another task's checkpoint file. | checkpoint destroyed |
+| **P22-34** | `Memory` stored projects whose ids differed only by case in one file, so `list('ProjectX')` and `list('projectx')` returned **the same records**. | cross-project record leak |
+| **P22-35** | `Memory.loadCheckpoint('projectx')` returned **ProjectX's** checkpoint. | cross-project checkpoint leak |
+| **P22-36** | A task id of `x.checkpoint` resolved to `x.checkpoint.json` — **task `x`'s checkpoint file** — and overwrote it. | checkpoint destroyed |
+
+P22-34 and P22-35 are the most serious of the seven: they are not data loss
+but **data disclosure across a project boundary**, and they occurred on the
+audit host (Windows) with ordinary, unremarkable inputs.
+
+**Fix.** The operating system is no longer asked which names are the same.
+AEGIS compares identifiers and filenames itself, so the answer is the same on
+Linux, macOS and Windows:
+
+- `paths.js` gains `findFilenameVariant(root, filename)` — a case-insensitive
+  name comparison over the directory, independent of the host filesystem.
+- `storage.js` compares the index's task ids and the directory's filenames
+  against the requested id, and refuses a case-variant id with
+  `TASK_ID_CONFLICT`. The index-name check (`_index` / `_INDEX`) is now
+  case-insensitive too.
+- `storage.js` and `recovery.js` verify **ownership** before overwriting: the
+  file at that path must be *this* record's file. A file that cannot be read
+  at all is also refused — ownership cannot be established — and
+  `remove()` / `clear()` followed by a write is the documented recovery.
+- `recovery.js` refuses a case-variant checkpoint id on both `save()` and
+  `clear()`.
+- `memory.js` refuses a case-variant project id on `add()` and
+  `saveCheckpoint()`, and `loadCheckpoint()` serves a checkpoint only to the
+  project id recorded inside it.
+
+A deliberately damaged file is still replaceable: a project file that cannot
+be parsed is this project's own broken file and is rewritten, while a file
+that *parses* but holds a foreign document is refused. That distinction is
+pinned by the existing atomic-write test.
+
+**Tests:** `test/phase22-aliasing-regressions.test.js` — 7 tests, one per
+finding, named for the finding they pin. Each was verified to **fail against
+the published pre-fix code and pass against the fix** (7 failing → 0 failing),
+so they are regression tests and not restatements of the fix.
+
+> **Why this section is in a security report and not a changelog.** Every one
+> of these seven is a trust-boundary failure: a caller-supplied identifier
+> reached a record belonging to a different task or project. The audit's own
+> P22-05 rule — *an identifier must mean the same thing on every platform* —
+> was implemented for *character* portability but not for *case* portability.
+> The CI runner found that gap on a platform the audit never ran on.
+
 ### P22-02 — Case-differing ids aliased to one file and destroyed each other
 
 **File:** `aegis/storage.js` (`Storage.put`, `Storage.get`)
@@ -245,7 +334,6 @@ The index lives at `state/_index.json`, inside the same directory as the task
 files. A task whose id was `_index` wrote directly over the index.
 
 **Fix:** `put()` refuses the collision with `INVALID_ID`.
-
 **Test:** `P22-03: a task id cannot resolve to the task index file` ·
 `adversarial: a task id cannot collide with the task index`
 
@@ -541,11 +629,11 @@ cannot choose the platform.
 
 | file | change |
 | ---- | ------ |
-| `aegis/paths.js` | reject Windows-invalid characters, control characters and device names |
-| `aegis/storage.js` | null-prototype index; index-file collision refused; same-file id conflict refused; internal-id check on read; **read-modify-write against the on-disk index** |
+| `aegis/paths.js` | reject Windows-invalid characters, control characters and device names; **`findFilenameVariant()` — case-insensitive filename comparison that does not depend on the host filesystem** |
+| `aegis/storage.js` | null-prototype index; index-file collision refused (case-insensitively); same-file id conflict refused; internal-id check on read; **read-modify-write against the on-disk index**; **case-variant ids refused; ownership verified before an overwrite; `remove()` will not unlink another task's file** |
 | `aegis/usage.js` | `wouldExceed()` mirrors `record()` exactly, including the attempts ceiling |
-| `aegis/recovery.js` | checkpoint shape, entry and version validation; atomic save with a unique temp name |
-| `aegis/memory.js` | atomic staged write; task-scoped context filtering |
+| `aegis/recovery.js` | checkpoint shape, entry and version validation; atomic save with a unique temp name; **case-variant ids refused on `save()` and `clear()`; ownership verified before an overwrite** |
+| `aegis/memory.js` | atomic staged write; task-scoped context filtering; **case-variant project ids refused; a checkpoint is served only to the project that wrote it** |
 | `aegis/tools/registry.js` | array-only allowlist; input-schema enforcement; risk ceiling must be known; default ceiling `external`; `fs.read` reads through an open descriptor; `auditFailures` counter; redacted input summaries |
 | `aegis/providers/http.js` | scheme check; 3xx rejected; hard total deadline; abort honoured; usable-usage accounting with a `reported` flag |
 | `aegis/providers/base.js` | `ProviderError` accepts a `code` |
@@ -553,9 +641,10 @@ cannot choose the platform.
 | `aegis/redact.js` | full credential-shape coverage; object keys redacted |
 | `aegis/audit.js` | key from `opts.key` → `AEGIS_AUDIT_KEY` → per-process random; `keyIsPersistent`; new `verify()` |
 | `scripts/scan-secrets.js` | the fixture allowlist is now **scoped to `test/`**; Phase 2.2 fixtures added |
-| `package.json` | `test:adversarial` and `test:phase22` scripts; the two new suites added to `test` and `test:phase2` |
+| `package.json` | `test:adversarial` and `test:phase22` scripts; the new suites added to `test` and `test:phase2` |
 | `test/adversarial.test.js` | **new** — 35 deterministic adversarial, fuzz and concurrency tests |
 | `test/phase22-regressions.test.js` | **new** — 32 named regression tests, one per finding |
+| `test/phase22-aliasing-regressions.test.js` | **new** — 7 named regression tests for P22-30 … P22-36 |
 
 No dependency was added. The architecture is unchanged: the same modules, the
 same interfaces, the same default-deny posture. `test:phase1` was not
@@ -565,27 +654,45 @@ touched.
 
 ## Test results
 
-### The two new suites
+### The new suites
 
 | suite | file | tests | result |
 | ----- | ---- | ----- | ------ |
 | adversarial / fuzz / concurrency | `test/adversarial.test.js` | 35 | 35 pass, 0 fail, 0 skipped |
 | Phase 2.2 regressions | `test/phase22-regressions.test.js` | 32 | 32 pass, 0 fail, 0 skipped |
+| Phase 2.2 identifier-aliasing regressions | `test/phase22-aliasing-regressions.test.js` | 7 | 7 pass, 0 fail, 0 skipped |
+| **Phase 2.2 total** | | **74** | **74 pass, 0 fail** |
 
 The adversarial harness is deterministic by construction: a seeded 32-bit
 linear congruential generator, a fixed hostile-identifier corpus, no
 wall-clock dependence in generated data, and no network access beyond a
 `127.0.0.1` mock server. A failure reproduces exactly.
 
-The regression suite names the finding it pins, so a failure points directly
-at the defect it protects.
+The regression suites name the finding they pin, so a failure points directly
+at the defect they protect.
+
+### The regressions were proved to fail before the fix
+
+A test that passes both before and after a change proves nothing about the
+change. The seven aliasing regressions were therefore run against the
+**published pre-fix code** (`git archive HEAD` → the `aegis/` tree as it was
+on the remote branch) and against the fixed tree:
+
+```
+PRE-FIX  (published git HEAD)   tests 7   pass 0   fail 7
+POST-FIX (working tree)         tests 7   pass 7   fail 0
+```
+
+The same before/after check was run for P22-16 in the first pass of this
+audit by temporarily reverting the `fs.read` implementation: the regression
+failed, and the temporary revert was immediately undone.
 
 ### Full suite
 
 ```
 npm test
-  tests   287
-  pass    286
+  tests   294
+  pass    293
   fail      0
   skipped   1     (the symlink test — Linux-only, verified on CI)
 ```
@@ -607,8 +714,8 @@ baseline script, and the eight Phase 1 test files are unchanged.
 
 ```
 npm run test:phase2
-  tests   231
-  pass    230
+  tests   238
+  pass    237
   fail      0
   skipped   1
 ```
@@ -655,16 +762,94 @@ parses it.
 deliberately refuses writes to `.github/` — the directory that controls what
 runs inside the repository — so a workflow edit could not be published. That
 turned out to cost nothing: the existing workflow's "Run the full test suite"
-step invokes `npm test`, and `npm test` now includes both new suites. The
-matrix therefore executes all 287 tests, including the 35 adversarial and 32
-regression tests, exactly as it would have with two extra named steps.
+step invokes `npm test`, and `npm test` now includes the three new suites. The
+matrix therefore executes all 294 tests — the 35 adversarial, the 32 Phase 2.2
+regressions and the 7 aliasing regressions — exactly as it would have with
+extra named steps.
 
-Two additional scripts are available for anyone who wants to run the suites
-in isolation: `npm run test:adversarial` and `npm run test:phase22`.
+Three additional scripts are available for anyone who wants to run the suites
+in isolation: `npm run test:adversarial`, `npm run test:phase22` (39 tests)
+and `npm run test:security`.
+
+### The first publication was red — and the runner was right
+
+The first push of this branch (`67760d4`) **failed on Linux**. All three legs
+of the matrix (Node 18, 20, 22) failed at the "Run the full test suite" step
+with the same two tests, while the entire suite passed on the Windows audit
+host:
+
+```
+run 40168325981 (node 18):  tests 287   pass 285   fail 2   skipped 0
+  not ok  adversarial: two ids that collide on a case-insensitive filesystem are refused
+  not ok  P22-02: two ids that resolve to the same file cannot overwrite each other
+```
+
+Both tests asserted that the id pair `Alpha` / `alpha` is refused. The P22-02
+fix detected the collision by *reading the file* the second id resolved to —
+which reports the other task's record only on a case-insensitive filesystem.
+On Linux the two names are separate files, the read returned nothing, the
+guard did not fire, and the tests failed. **The audit had shipped a fix whose
+correctness depended on the filesystem it was written on.** The CI runner —
+running on the one platform the audit host could not be — was the only thing
+that caught it.
+
+Diagnosing that failure showed the same question being answered by the
+operating system in six further places, every one a way to destroy or leak
+another task's or project's records. Those seven findings (P22-30 … P22-36)
+are described in the [High severity](#high-severity) section above; the fix
+compares identifiers directly and behaves identically on every platform.
 
 ### Verified runs
 
-<!-- CI-RESULTS -->
+The branch tip is green. The matrix below was executed by GitHub Actions on
+Linux for the exact tree that contains every fix in this report — run
+**[40491307156](https://github.com/gravion-ux/project-aegis/actions/runs/40491307156)**,
+head `fdf24ab`, conclusion **success**.
+
+| job | node | job | conclusion | full suite | Phase 1 suite |
+| --- | ---- | --- | ---------- | ---------- | -------------- |
+| `test (node 20)` | 20.x | [122145642904](https://github.com/gravion-ux/project-aegis/actions/runs/40491307156/job/122145642904) | success | 294 pass / 0 fail / 0 skipped | 56 pass / 0 fail |
+| `test (node 18)` | 18.x | [122145643140](https://github.com/gravion-ux/project-aegis/actions/runs/40491307156/job/122145643140) | success | 294 pass / 0 fail / 0 skipped | 56 pass / 0 fail |
+| `test (node 22)` | 22.x | [122145643326](https://github.com/gravion-ux/project-aegis/actions/runs/40491307156/job/122145643326) | success | 294 pass / 0 fail / 0 skipped | 56 pass / 0 fail |
+
+Every number above was read back from the job log, not inferred from a green
+badge: each job prints two `node --test` blocks, and both were parsed for
+`# tests / # pass / # fail / # skipped`.
+
+On all three legs:
+
+- `# not ok` count: **0**.
+- The Linux-only symlink guard passed — `ok 236 - security: fs.read refuses to
+  follow a symlink out of the allowed root`.
+- The seven aliasing regressions passed — `ok 100` … `ok 106`
+  (P22-30 … P22-36).
+
+### Run history for this branch
+
+Each row below is a separate, real workflow run. None was cancelled, skipped
+or re-run in place to obtain a green result.
+
+| run | head | conclusion | what that head contained |
+| ---- | ---- | ---------- | ------------------------ |
+| [40491307156](https://github.com/gravion-ux/project-aegis/actions/runs/40491307156) | `fdf24ab` | success | the complete fix set with the aliasing suite wired into `npm test` — the first run to execute all **294** tests |
+| [40491294702](https://github.com/gravion-ux/project-aegis/actions/runs/40491294702) | `f7819d1` | success | the fix set plus the aliasing test file, **not yet** listed in `npm test` — 287 / 287, so the new suite did not yet run in CI |
+| [40491283861](https://github.com/gravion-ux/project-aegis/actions/runs/40491283861) | `7ef4c9b` | success | + `aegis/memory.js` |
+| [40491275930](https://github.com/gravion-ux/project-aegis/actions/runs/40491275930) | `2516b6e` | success | + `aegis/recovery.js` |
+| [40490739787](https://github.com/gravion-ux/project-aegis/actions/runs/40490739787) | `7597e4f` | success | + `aegis/storage.js` |
+| [40490733759](https://github.com/gravion-ux/project-aegis/actions/runs/40490733759) | `96b785b` | **failure** | + `aegis/paths.js` only — the shared helper without the storage guard that uses it; the same two case-collision tests failed (287 / 285 / 2) |
+| [40168325981](https://github.com/gravion-ux/project-aegis/actions/runs/40168325981) | `67760d4` | **failure** | the first publication of this audit — the same two case-collision tests failed (287 / 285 / 2) |
+
+The `96b785b` failure was an expected consequence of publishing the shared
+helper before the guards that use it: the helper alone changed no behaviour,
+so the two original Linux failures were still present. It is recorded here
+rather than hidden, because a branch history that only ever shows green would
+misrepresent how the fix was sequenced and which failures were real.
+
+Publishing this report is a documentation-only change — it touches no source,
+test or workflow file — and it triggers one further matrix run on the branch.
+That run's conclusion is recorded in the delivery notes accompanying this
+report rather than here, because the report cannot cite a run that does not
+exist at the moment it is written.
 
 ---
 
@@ -755,11 +940,15 @@ Stated plainly, because a passing suite is not a security property.
 
 1. ~~Capture the baseline before modifying.~~ **Done** —
    [`PHASE22_BASELINE.md`](./PHASE22_BASELINE.md).
-2. ~~Reproduce every suspected defect before fixing it.~~ **Done** — 29
-   findings, each reproduced against the unmodified tree.
-3. ~~Pin every confirmed defect with a regression test.~~ **Done** — 31
-   named regression tests plus 35 adversarial tests.
-4. ~~Extend CI with the new suites and verify the matrix.~~ **Done**.
+2. ~~Reproduce every suspected defect before fixing it.~~ **Done** — 36
+   findings, each reproduced against the unmodified (and, for the aliasing
+   family, the **published**) tree.
+3. ~~Pin every confirmed defect with a regression test.~~ **Done** — 39
+   named regression tests plus 35 adversarial tests. The 7 aliasing
+   regressions were additionally proved to fail against the published
+   pre-fix code.
+4. ~~Extend CI with the new suites and verify the matrix.~~ **Done** — and
+   the first red matrix run is what exposed findings P22-30 … P22-36.
 5. Give `Budget` a real `maxAttempts` in `aegis.config.example.json` so the
    retry bound is on by default rather than merely available.
 6. Add a lock file for multi-process state safety, and a real multi-process
